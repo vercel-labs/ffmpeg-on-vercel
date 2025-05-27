@@ -27,7 +27,7 @@ export async function GET(request: NextRequest): Promise<NextResponse> {
     // Define paths - assuming file is in public/videos/
     const inputPath = path.join(process.cwd(), "public", "videos", inputFile);
 
-    // Check if input file exists
+    // Check if input file exists.
     try {
       await fs.access(inputPath);
     } catch {
