@@ -14,7 +14,7 @@ export async function GET(request: NextRequest): Promise<NextResponse> {
   const { searchParams } = new URL(request.url);
   const inputFile = "sample.mp4";
   const format = searchParams.get("format") || "webm";
-  const quality = searchParams.get("quality") || "low";
+  const quality = searchParams.get("quality") || "medium";
 
   if (!inputFile) {
     return NextResponse.json(
@@ -64,42 +64,75 @@ export async function GET(request: NextRequest): Promise<NextResponse> {
     ];
 
     // Run FFmpeg conversion
-    const convertedBuffer = await new Promise<Buffer>((resolve, reject) => {
-      if (!ffmpeg) {
-        reject(new Error("FFmpeg binary not found"));
-        return;
-      }
-
-      const process = spawn("./node_modules/ffmpeg-static/ffmpeg", ffmpegArgs, { stdio: 'pipe'});
-
-      let buffers: Buffer[] = [];
-      let stderr = "";
-      process.stdout.on("data", (data: Buffer) => {
-        buffers.push(data);
-      });
-      process.stderr.on("data", (data: Buffer) => {
-        stderr += data.toString();
-      });
-
-      process.on("close", (code: number | null) => {
-        if (code === 0) {
-          resolve(Buffer.concat(buffers));
-        } else {
-          reject(new Error(`FFmpeg failed with code ${code}: ${stderr}`));
+    const readableStream = new ReadableStream({
+      start(controller) {
+        if (!ffmpeg) {
+          controller.error(new Error("FFmpeg binary not found"));
+          return;
         }
-      });
 
-      process.on("error", (error: Error) => {
-        reject(error);
-      });
+        const process = spawn("./node_modules/ffmpeg-static/ffmpeg", ffmpegArgs, { stdio: 'pipe'});
+
+        let stderr = "";
+        let isClosed = false;
+        
+        process.stdout.on("data", (data: Buffer) => {
+          if (!isClosed) {
+            try {
+              controller.enqueue(new Uint8Array(data));
+            } catch (error) {
+              // Controller might be closed, ignore the error
+            }
+          }
+        });
+        
+        process.stderr.on("data", (data: Buffer) => {
+          stderr += data.toString();
+        });
+
+        process.on("close", (code: number | null) => {
+          if (!isClosed) {
+            isClosed = true;
+            if (code === 0) {
+              try {
+                if (controller.desiredSize !== null) {
+                  controller.close();
+                }
+              } catch (error) {
+                // Controller already closed by client
+              }
+            } else {
+              try {
+                if (controller.desiredSize !== null) {
+                  controller.error(new Error(`FFmpeg failed with code ${code}: ${stderr}`));
+                }
+              } catch (error) {
+                // Controller already closed by client
+              }
+            }
+          }
+        });
+
+        process.on("error", (error: Error) => {
+          if (!isClosed) {
+            isClosed = true;
+            try {
+              if (controller.desiredSize !== null) {
+                controller.error(error);
+              }
+            } catch (error) {
+              // Controller already closed by client
+            }
+          }
+        });
+      }
     });
 
-    // Set appropriate headers for file download
+    // Set appropriate headers for streaming
     const headers = new Headers();
     headers.set("Content-Type", `video/${format}`);
-    headers.set("Content-Length", convertedBuffer.byteLength.toString());
 
-    return new NextResponse(convertedBuffer, {
+    return new NextResponse(readableStream, {
       status: 200,
       headers,
     });
