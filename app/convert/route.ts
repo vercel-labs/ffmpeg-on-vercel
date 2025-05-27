@@ -13,7 +13,7 @@ interface QualitySettings {
 export async function GET(request: NextRequest): Promise<NextResponse> {
   const { searchParams } = new URL(request.url);
   const inputFile = "sample.mp4";
-  const format = searchParams.get("format") || "mp4";
+  const format = searchParams.get("format") || "webm";
   const quality = searchParams.get("quality") || "medium";
 
   if (!inputFile) {
@@ -26,9 +26,8 @@ export async function GET(request: NextRequest): Promise<NextResponse> {
   try {
     // Define paths - assuming file is in public/videos/
     const inputPath = path.join(process.cwd(), "public", "videos", inputFile);
-    const outputPath = path.join("/tmp", `converted_${Date.now()}.${format}`);
 
-    // Check if input file exists
+    // Check if input file exists.
     try {
       await fs.access(inputPath);
     } catch {
@@ -45,60 +44,95 @@ export async function GET(request: NextRequest): Promise<NextResponse> {
       high: ["-crf", "18", "-preset", "slow"],
     };
 
+    const videoCodec = format === "webm" ? "libvpx-vp9" : "libx264";
+    const audioCodec = format === "webm" ? "libopus" : "aac";
+    const fastStart = format === "webm" ? [] : ["-movflags", "+faststart"];
+
     // FFmpeg arguments for conversion
     const ffmpegArgs = [
       "-i",
       inputPath,
       "-c:v",
-      "libx264",
+      videoCodec,
       "-c:a",
-      "aac",
+      audioCodec,
       ...qualitySettings[quality],
-      "-movflags",
-      "+faststart", // Optimize for web streaming
-      "-y", // Overwrite output file
-      outputPath,
+      ...fastStart,
+      "-f",
+      format,
+      "pipe:1", // pipe to stdout
     ];
 
     // Run FFmpeg conversion
-    await new Promise<void>((resolve, reject) => {
-      if (!ffmpeg) {
-        reject(new Error("FFmpeg binary not found"));
-        return;
-      }
-
-      const process = spawn("./node_modules/ffmpeg-static/ffmpeg", ffmpegArgs);
-
-      let stderr = "";
-      process.stderr.on("data", (data: Buffer) => {
-        stderr += data.toString();
-      });
-
-      process.on("close", (code: number | null) => {
-        if (code === 0) {
-          resolve();
-        } else {
-          reject(new Error(`FFmpeg failed with code ${code}: ${stderr}`));
+    const readableStream = new ReadableStream({
+      start(controller) {
+        if (!ffmpeg) {
+          controller.error(new Error("FFmpeg binary not found"));
+          return;
         }
-      });
 
-      process.on("error", (error: Error) => {
-        reject(error);
-      });
+        const process = spawn("./node_modules/ffmpeg-static/ffmpeg", ffmpegArgs, { stdio: 'pipe'});
+
+        let stderr = "";
+        let isClosed = false;
+        
+        process.stdout.on("data", (data: Buffer) => {
+          if (!isClosed) {
+            try {
+              controller.enqueue(new Uint8Array(data));
+            } catch (error) {
+              // Controller might be closed, ignore the error
+            }
+          }
+        });
+        
+        process.stderr.on("data", (data: Buffer) => {
+          stderr += data.toString();
+        });
+
+        process.on("close", (code: number | null) => {
+          if (!isClosed) {
+            isClosed = true;
+            if (code === 0) {
+              try {
+                if (controller.desiredSize !== null) {
+                  controller.close();
+                }
+              } catch (error) {
+                // Controller already closed by client
+              }
+            } else {
+              try {
+                if (controller.desiredSize !== null) {
+                  controller.error(new Error(`FFmpeg failed with code ${code}: ${stderr}`));
+                }
+              } catch (error) {
+                // Controller already closed by client
+              }
+            }
+          }
+        });
+
+        process.on("error", (error: Error) => {
+          if (!isClosed) {
+            isClosed = true;
+            try {
+              if (controller.desiredSize !== null) {
+                controller.error(error);
+              }
+            } catch (error) {
+              // Controller already closed by client
+            }
+          }
+        });
+      }
     });
 
-    // Read the converted file
-    const convertedBuffer = await fs.readFile(outputPath);
-
-    // Clean up temp file
-    await fs.unlink(outputPath).catch(() => {}); // Ignore cleanup errors
-
-    // Set appropriate headers for file download
+    // Set appropriate headers for streaming
     const headers = new Headers();
     headers.set("Content-Type", `video/${format}`);
-    headers.set("Content-Length", convertedBuffer.length.toString());
 
-    return new NextResponse(convertedBuffer as unknown as BodyInit, {
+    return new NextResponse(readableStream, {
       status: 200,
       headers,
     });
