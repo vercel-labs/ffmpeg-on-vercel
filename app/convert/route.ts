@@ -13,8 +13,8 @@ interface QualitySettings {
 export async function GET(request: NextRequest): Promise<NextResponse> {
   const { searchParams } = new URL(request.url);
   const inputFile = "sample.mp4";
-  const format = searchParams.get("format") || "mp4";
-  const quality = searchParams.get("quality") || "medium";
+  const format = searchParams.get("format") || "webm";
+  const quality = searchParams.get("quality") || "low";
 
   if (!inputFile) {
     return NextResponse.json(
@@ -26,7 +26,6 @@ export async function GET(request: NextRequest): Promise<NextResponse> {
   try {
     // Define paths - assuming file is in public/videos/
     const inputPath = path.join(process.cwd(), "public", "videos", inputFile);
-    const outputPath = path.join("/tmp", `converted_${Date.now()}.${format}`);
 
     // Check if input file exists
     try {
@@ -45,38 +44,46 @@ export async function GET(request: NextRequest): Promise<NextResponse> {
       high: ["-crf", "18", "-preset", "slow"],
     };
 
+    const videoCodec = format === "webm" ? "libvpx-vp9" : "libx264";
+    const audioCodec = format === "webm" ? "libopus" : "aac";
+    const fastStart = format === "webm" ? [] : ["-movflags", "+faststart"];
+
     // FFmpeg arguments for conversion
     const ffmpegArgs = [
       "-i",
       inputPath,
       "-c:v",
-      "libx264",
+      videoCodec,
       "-c:a",
-      "aac",
+      audioCodec,
       ...qualitySettings[quality],
-      "-movflags",
-      "+faststart", // Optimize for web streaming
-      "-y", // Overwrite output file
-      outputPath,
+      ...fastStart,
+      "-f",
+      format,
+      "pipe:1", // pipe to stdout
     ];
 
     // Run FFmpeg conversion
-    await new Promise<void>((resolve, reject) => {
+    const convertedBuffer = await new Promise<Buffer>((resolve, reject) => {
       if (!ffmpeg) {
         reject(new Error("FFmpeg binary not found"));
         return;
       }
 
-      const process = spawn("./node_modules/ffmpeg-static/ffmpeg", ffmpegArgs);
+      const process = spawn("./node_modules/ffmpeg-static/ffmpeg", ffmpegArgs, { stdio: 'pipe'});
 
+      let buffers: Buffer[] = [];
       let stderr = "";
+      process.stdout.on("data", (data: Buffer) => {
+        buffers.push(data);
+      });
       process.stderr.on("data", (data: Buffer) => {
         stderr += data.toString();
       });
 
       process.on("close", (code: number | null) => {
         if (code === 0) {
-          resolve();
+          resolve(Buffer.concat(buffers));
         } else {
           reject(new Error(`FFmpeg failed with code ${code}: ${stderr}`));
         }
@@ -87,18 +94,12 @@ export async function GET(request: NextRequest): Promise<NextResponse> {
       });
     });
 
-    // Read the converted file
-    const convertedBuffer = await fs.readFile(outputPath);
-
-    // Clean up temp file
-    await fs.unlink(outputPath).catch(() => {}); // Ignore cleanup errors
-
     // Set appropriate headers for file download
     const headers = new Headers();
     headers.set("Content-Type", `video/${format}`);
-    headers.set("Content-Length", convertedBuffer.length.toString());
+    headers.set("Content-Length", convertedBuffer.byteLength.toString());
 
-    return new NextResponse(convertedBuffer as unknown as BodyInit, {
+    return new NextResponse(convertedBuffer, {
       status: 200,
       headers,
     });
